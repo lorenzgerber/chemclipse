@@ -6,14 +6,16 @@
  * which is available at https://www.eclipse.org/legal/epl-2.0/
  *
  * SPDX-License-Identifier: EPL-2.0
- * 
+ *
  * Contributors:
  * Philip Wenig - initial API and implementation
  * Alexander Kerner - implementation
  * Christoph Läubrich - honor the mark mode
+ * Lorenz Gerber - generic data store backend
  *******************************************************************************/
 package org.eclipse.chemclipse.msd.model.core;
 
+import java.util.AbstractList;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -21,6 +23,7 @@ import java.util.Comparator;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
+import java.util.NoSuchElementException;
 import java.util.Objects;
 import java.util.Set;
 
@@ -29,6 +32,7 @@ import org.eclipse.chemclipse.model.core.AbstractScan;
 import org.eclipse.chemclipse.model.core.MarkedTraceModus;
 import org.eclipse.chemclipse.msd.model.core.comparator.IonCombinedComparator;
 import org.eclipse.chemclipse.msd.model.core.comparator.IonComparatorMode;
+import org.eclipse.chemclipse.msd.model.core.store.IChromatogramDataStore;
 import org.eclipse.chemclipse.msd.model.core.support.IMarkedIons;
 import org.eclipse.chemclipse.msd.model.core.support.MarkedIons;
 import org.eclipse.chemclipse.msd.model.implementation.ImmutableZeroIon;
@@ -74,6 +78,11 @@ public abstract class AbstractScanMSD extends AbstractScan implements IScanMSD {
 	private ImmutableZeroIon immutableZeroIon;
 	private IScanMSD optimizedMassSpectrum;
 
+	/** Compact store — null means ionsList is the canonical source. */
+	private transient IChromatogramDataStore dataStore;
+	/** Zero-based index of this scan within dataStore. */
+	private transient int storeIndex = -1;
+
 	protected AbstractScanMSD() {
 
 		super();
@@ -90,7 +99,7 @@ public abstract class AbstractScanMSD extends AbstractScan implements IScanMSD {
 	/**
 	 * Creates a new instance of {@code AbstractScanMSD} by creating a shallow copy
 	 * of provided {@code templateScan}.
-	 * 
+	 *
 	 * @param templateScan
 	 *            {@link IScanMSD scan} that is used as a template
 	 */
@@ -116,6 +125,51 @@ public abstract class AbstractScanMSD extends AbstractScan implements IScanMSD {
 		 */
 		createNewIonList();
 		immutableZeroIon = new ImmutableZeroIon();
+	}
+
+	/**
+	 * Attaches a compact data store to this scan. The store becomes the canonical
+	 * source of ion data; ionsList is kept empty and used only if the scan is later
+	 * mutated (materializeFromStore is called on the first write).
+	 */
+	public final void attachStore(IChromatogramDataStore store, int scanIndex) {
+
+		this.dataStore = store;
+		this.storeIndex = scanIndex;
+		this.ionsList.clear();
+	}
+
+	/**
+	 * Detaches the store if one is attached. No-op otherwise.
+	 * Call before accessing ionsList for reads — not needed for writes since
+	 * write paths call materializeFromStore() which handles detachment.
+	 */
+	public final void detachStore() {
+
+		dataStore = null;
+		storeIndex = -1;
+	}
+
+	/**
+	 * On first write when a store is attached: copies all store ions into ionsList,
+	 * then detaches the store so subsequent writes go directly to ionsList.
+	 */
+	private void materializeFromStore() {
+
+		if(dataStore == null) {
+			return;
+		}
+		int count = dataStore.getIonCount(storeIndex);
+		double[] mzs = new double[count];
+		float[] abs = new float[count];
+		dataStore.getMzValues(storeIndex, mzs);
+		dataStore.getIntensityValues(storeIndex, abs);
+		ionsList = new ArrayList<>(count);
+		for(int i = 0; i < count; i++) {
+			ionsList.add(new Ion(mzs[i], abs[i]));
+		}
+		dataStore = null;
+		storeIndex = -1;
 	}
 
 	@Override
@@ -150,7 +204,7 @@ public abstract class AbstractScanMSD extends AbstractScan implements IScanMSD {
 			logger.warn("The ion must be not null.");
 			return this;
 		}
-
+		materializeFromStore();
 		boolean addNew = true;
 		if(checkIntensityCollisions()) {
 			for(IIon actualIon : ionsList) {
@@ -190,6 +244,7 @@ public abstract class AbstractScanMSD extends AbstractScan implements IScanMSD {
 	@Override
 	public AbstractScanMSD addIon(IIon ion, boolean checked) {
 
+		materializeFromStore();
 		if(checked) {
 			addIon(ion);
 		} else {
@@ -208,6 +263,7 @@ public abstract class AbstractScanMSD extends AbstractScan implements IScanMSD {
 	@Override
 	public AbstractScanMSD removeIon(IIon ion) {
 
+		materializeFromStore();
 		ionsList.remove(ion);
 		return this;
 	}
@@ -215,7 +271,12 @@ public abstract class AbstractScanMSD extends AbstractScan implements IScanMSD {
 	@Override
 	public AbstractScanMSD removeAllIons() {
 
-		ionsList.clear();
+		if(dataStore != null) {
+			dataStore = null;
+			storeIndex = -1;
+		} else {
+			ionsList.clear();
+		}
 		return this;
 	}
 
@@ -238,7 +299,7 @@ public abstract class AbstractScanMSD extends AbstractScan implements IScanMSD {
 			// TODO maybe log warning?
 			return this;
 		}
-
+		materializeFromStore();
 		List<IIon> ionsToRemove = new ArrayList<>();
 		/*
 		 * Get the list of ions for removal.
@@ -259,7 +320,7 @@ public abstract class AbstractScanMSD extends AbstractScan implements IScanMSD {
 			// TODO maybe log warning?
 			return this;
 		}
-
+		materializeFromStore();
 		Set<Integer> nominalIons = markedIons.getIonsNominal();
 		MarkedTraceModus markedTraceModus = markedIons.getMarkedTraceModus();
 		switch(markedTraceModus) {
@@ -288,7 +349,6 @@ public abstract class AbstractScanMSD extends AbstractScan implements IScanMSD {
 				 */
 				break;
 		}
-
 		return this;
 	}
 
@@ -299,12 +359,20 @@ public abstract class AbstractScanMSD extends AbstractScan implements IScanMSD {
 	@Override
 	public List<IIon> getIons() {
 
+		if(dataStore != null) {
+			return new StoreBackedIonList(dataStore, storeIndex);
+		}
 		return Collections.unmodifiableList(ionsList);
 	}
 
 	public void clearIons() {
 
-		this.ionsList.clear();
+		if(dataStore != null) {
+			dataStore = null;
+			storeIndex = -1;
+		} else {
+			this.ionsList.clear();
+		}
 	}
 
 	@Override
@@ -317,10 +385,7 @@ public abstract class AbstractScanMSD extends AbstractScan implements IScanMSD {
 		if(markedIons == null || markedIons.isEmpty()) {
 			totalSignal = getTotalSignal();
 		} else {
-			IIon ion;
-			Iterator<IIon> iterator = ionsList.iterator();
-			while(iterator.hasNext()) {
-				ion = iterator.next();
+			for(IIon ion : getIons()) {
 				if(useIon(ion, markedIons)) {
 					totalSignal += ion.getAbundance();
 				}
@@ -345,6 +410,9 @@ public abstract class AbstractScanMSD extends AbstractScan implements IScanMSD {
 	@Override
 	public float getTotalSignal() {
 
+		if(dataStore != null) {
+			return dataStore.getTotalSignal(storeIndex);
+		}
 		IIon ion;
 		float totalSignal = 0;
 		Iterator<IIon> iterator = ionsList.iterator();
@@ -412,7 +480,7 @@ public abstract class AbstractScanMSD extends AbstractScan implements IScanMSD {
 
 		if(hasIons()) {
 			Comparator<IIon> comparator = new IonCombinedComparator(IonComparatorMode.ABUNDANCE_FIRST);
-			return Collections.max(ionsList, comparator);
+			return Collections.max(getIons(), comparator);
 		} else {
 			return immutableZeroIon;
 		}
@@ -423,7 +491,7 @@ public abstract class AbstractScanMSD extends AbstractScan implements IScanMSD {
 
 		if(hasIons()) {
 			Comparator<IIon> comparator = new IonCombinedComparator(IonComparatorMode.MZ_FIRST);
-			return Collections.max(ionsList, comparator);
+			return Collections.max(getIons(), comparator);
 		} else {
 			return immutableZeroIon;
 		}
@@ -434,7 +502,7 @@ public abstract class AbstractScanMSD extends AbstractScan implements IScanMSD {
 
 		if(hasIons()) {
 			Comparator<IIon> comparator = new IonCombinedComparator(IonComparatorMode.ABUNDANCE_FIRST);
-			return Collections.min(ionsList, comparator);
+			return Collections.min(getIons(), comparator);
 		} else {
 			return immutableZeroIon;
 		}
@@ -445,7 +513,7 @@ public abstract class AbstractScanMSD extends AbstractScan implements IScanMSD {
 
 		if(hasIons()) {
 			Comparator<IIon> comparator = new IonCombinedComparator(IonComparatorMode.MZ_FIRST);
-			return Collections.min(ionsList, comparator);
+			return Collections.min(getIons(), comparator);
 		} else {
 			return immutableZeroIon;
 		}
@@ -454,12 +522,11 @@ public abstract class AbstractScanMSD extends AbstractScan implements IScanMSD {
 	@Override
 	public IIonBounds getIonBounds() {
 
-		IIon lowest = null;
-		IIon highest = null;
 		if(hasIons()) {
 			Comparator<IIon> comparator = new IonCombinedComparator(IonComparatorMode.MZ_FIRST);
-			lowest = Collections.min(ionsList, comparator);
-			highest = Collections.max(ionsList, comparator);
+			List<IIon> ions = getIons();
+			IIon lowest = Collections.min(ions, comparator);
+			IIon highest = Collections.max(ions, comparator);
 			return new IonBounds(lowest, highest);
 		} else {
 			return null;
@@ -469,12 +536,18 @@ public abstract class AbstractScanMSD extends AbstractScan implements IScanMSD {
 	@Override
 	public int getNumberOfIons() {
 
+		if(dataStore != null) {
+			return dataStore.getIonCount(storeIndex);
+		}
 		return ionsList.size();
 	}
 
 	@Override
 	public boolean isEmpty() {
 
+		if(dataStore != null) {
+			return dataStore.getIonCount(storeIndex) == 0;
+		}
 		return ionsList.isEmpty();
 	}
 
@@ -483,7 +556,7 @@ public abstract class AbstractScanMSD extends AbstractScan implements IScanMSD {
 
 		if(hasIons()) {
 			IExtractedIonSignal extractedIonSignal = new ExtractedIonSignal(ion, ion);
-			for(IIon actualIon : ionsList) {
+			for(IIon actualIon : getIons()) {
 				extractedIonSignal.setAbundance(actualIon);
 			}
 			float abundance = extractedIonSignal.getAbundance(ion);
@@ -502,7 +575,7 @@ public abstract class AbstractScanMSD extends AbstractScan implements IScanMSD {
 	public IIon getIon(double ion) {
 
 		if(hasIons()) {
-			for(IIon actualIon : ionsList) {
+			for(IIon actualIon : getIons()) {
 				if(actualIon.getIon() == ion) {
 					return actualIon;
 				}
@@ -518,7 +591,7 @@ public abstract class AbstractScanMSD extends AbstractScan implements IScanMSD {
 	public IIon getIon(double ion, int precision) {
 
 		if(hasIons()) {
-			for(IIon actualIon : ionsList) {
+			for(IIon actualIon : getIons()) {
 				double accurateIon = AbstractIon.getIon(actualIon.getIon(), precision);
 				if(accurateIon == AbstractIon.getIon(ion, precision)) {
 					return new Ion(accurateIon, actualIon.getAbundance());
@@ -546,6 +619,7 @@ public abstract class AbstractScanMSD extends AbstractScan implements IScanMSD {
 		if(percentage == 0.0f) {
 			return;
 		}
+		materializeFromStore();
 		float abundance;
 		for(IIon ion : ionsList) {
 			abundance = ion.getAbundance();
@@ -570,6 +644,7 @@ public abstract class AbstractScanMSD extends AbstractScan implements IScanMSD {
 		if(getTotalSignal() == 0.0f) {
 			return;
 		}
+		materializeFromStore();
 		float base = 100.0f;
 		float correctionFactor = ((base / getTotalSignal()) * totalSignal) / base;
 		float abundance;
@@ -597,7 +672,7 @@ public abstract class AbstractScanMSD extends AbstractScan implements IScanMSD {
 
 	/**
 	 * Creates a new mass spectrum.
-	 * 
+	 *
 	 * @param excludedIons
 	 * @return IMassSpectrum
 	 */
@@ -609,7 +684,7 @@ public abstract class AbstractScanMSD extends AbstractScan implements IScanMSD {
 		IScanMSD massSpectrum = new ScanMSD();
 		IIon ion;
 		Set<Integer> excludedIonsNominal = excludedIons.getIonsNominal();
-		for(IIon actualIon : ionsList) {
+		for(IIon actualIon : getIons()) {
 			int mz = (int)actualIon.getIon();
 			if(!excludedIonsNominal.contains(mz)) {
 				ion = new Ion(actualIon);
@@ -622,6 +697,9 @@ public abstract class AbstractScanMSD extends AbstractScan implements IScanMSD {
 	@Override
 	public boolean hasIons() {
 
+		if(dataStore != null) {
+			return dataStore.getIonCount(storeIndex) > 0;
+		}
 		return !ionsList.isEmpty();
 	}
 
@@ -668,9 +746,9 @@ public abstract class AbstractScanMSD extends AbstractScan implements IScanMSD {
 			return this;
 		}
 		/*
-		 * There is at least 1 ion stored in the list otherwise the code would not have
-		 * reached this point.
+		 * Normalize mutates abundances — must work on ionsList, not flyweights.
 		 */
+		materializeFromStore();
 		List<IIon> ions = getIons();
 		Comparator<IIon> comparator = new IonCombinedComparator(IonComparatorMode.ABUNDANCE_FIRST);
 		double highestAbundance = Collections.max(ions, comparator).getAbundance();
@@ -702,6 +780,8 @@ public abstract class AbstractScanMSD extends AbstractScan implements IScanMSD {
 
 	protected void setIons(Collection<? extends IIon> ions) {
 
+		dataStore = null;
+		storeIndex = -1;
 		this.ionsList = new ArrayList<>(ions);
 	}
 
@@ -714,16 +794,17 @@ public abstract class AbstractScanMSD extends AbstractScan implements IScanMSD {
 	@Override
 	public boolean isMeasurementSIM() {
 
-		if(!ionsList.isEmpty() && ionsList.size() <= LIMIT_SIM_MEASUREMENT) {
-			return true;
-		} else {
-			return false;
-		}
+		int count = getNumberOfIons();
+		return count > 0 && count <= LIMIT_SIM_MEASUREMENT;
 	}
 
 	@Override
 	public boolean isTandemMS() {
 
+		if(dataStore != null) {
+			// Store-backed scans never contain MRM/tandem data (Phase 1 scope)
+			return false;
+		}
 		int limit = (ionsList.size() > 30) ? 30 : ionsList.size();
 		for(int i = 0; i < limit; i++) {
 			IIon ion = ionsList.get(i);
@@ -737,7 +818,8 @@ public abstract class AbstractScanMSD extends AbstractScan implements IScanMSD {
 	@Override
 	public boolean isHighResolutionMS() {
 
-		if(ionsList.size() > 3000) {
+		int size = getNumberOfIons();
+		if(size > 3000) {
 			return true;
 		} else {
 			/*
@@ -745,14 +827,13 @@ public abstract class AbstractScanMSD extends AbstractScan implements IScanMSD {
 			 */
 			int counterNominal = 0;
 			int counterHighRes = 0;
-			int size = ionsList.size();
 			int limit = 10;
-
+			List<IIon> ions = getIons();
 			if(size <= limit) {
 				/*
 				 * Check all
 				 */
-				for(IIon ion : ionsList) {
+				for(IIon ion : ions) {
 					String[] parts = Double.toString(ion.getIon()).split("\\.");
 					if(parts[1].length() <= 1) {
 						counterNominal++;
@@ -762,9 +843,9 @@ public abstract class AbstractScanMSD extends AbstractScan implements IScanMSD {
 				}
 			} else {
 				int modulo = size / 10;
-				for(int i = 0; i < ionsList.size(); i++) {
+				int i = 0;
+				for(IIon ion : ions) {
 					if(i % modulo == 0) {
-						IIon ion = ionsList.get(i);
 						String[] parts = Double.toString(ion.getIon()).split("\\.");
 						if(parts[1].length() <= 1) {
 							counterNominal++;
@@ -772,9 +853,9 @@ public abstract class AbstractScanMSD extends AbstractScan implements IScanMSD {
 							counterHighRes++;
 						}
 					}
+					i++;
 				}
 			}
-
 			return counterHighRes > counterNominal;
 		}
 	}
@@ -821,7 +902,7 @@ public abstract class AbstractScanMSD extends AbstractScan implements IScanMSD {
 			builder.append(getNormalizationBase());
 		}
 		builder.append(",Ion/Abundance pairs: ");
-		Iterator<IIon> iter = ionsList.iterator();
+		Iterator<IIon> iter = getIons().iterator();
 		while(iter.hasNext()) {
 			IIon ion = iter.next();
 			builder.append(ion.getIon());
@@ -840,12 +921,14 @@ public abstract class AbstractScanMSD extends AbstractScan implements IScanMSD {
 
 		AbstractScanMSD massSpectrum = (AbstractScanMSD)super.clone();
 		massSpectrum.createNewIonList();
+		massSpectrum.dataStore = null;
+		massSpectrum.storeIndex = -1;
 		return massSpectrum;
 	}
 
 	/**
 	 * Adds both intensities from firstIon to secondIon.
-	 * 
+	 *
 	 * @param firstIon
 	 * @param secondIon
 	 */
@@ -856,7 +939,7 @@ public abstract class AbstractScanMSD extends AbstractScan implements IScanMSD {
 
 	/**
 	 * Adds the intensity of firstIon to secondIon.
-	 * 
+	 *
 	 * @param firstIon
 	 * @param secondIon
 	 */
@@ -876,7 +959,7 @@ public abstract class AbstractScanMSD extends AbstractScan implements IScanMSD {
 
 	/**
 	 * Checks if the given ion mass over charge ratio (ion) should be removed.
-	 * 
+	 *
 	 * @param ions
 	 * @param actualIon
 	 * @return boolean
@@ -897,7 +980,7 @@ public abstract class AbstractScanMSD extends AbstractScan implements IScanMSD {
 
 	/**
 	 * Removes all ions stored in the list from the actual mass spectrum.
-	 * 
+	 *
 	 * @param ionsToRemove
 	 */
 	private void removeIonsFromMassSpectrum(List<IIon> ionsToRemove) {
@@ -933,5 +1016,67 @@ public abstract class AbstractScanMSD extends AbstractScan implements IScanMSD {
 
 		// Both are MS1 ions at same m/z
 		return true;
+	}
+
+	// ── Store-backed list view ────────────────────────────────────────────────
+
+	private static final class StoreBackedIonList extends AbstractList<IIon> {
+
+		private final IChromatogramDataStore store;
+		private final int scanIndex;
+
+		StoreBackedIonList(IChromatogramDataStore store, int scanIndex) {
+
+			this.store = store;
+			this.scanIndex = scanIndex;
+		}
+
+		@Override
+		public IIon get(int index) {
+
+			return new Ion(store.getMz(scanIndex, index), store.getIntensity(scanIndex, index));
+		}
+
+		@Override
+		public int size() {
+
+			return store.getIonCount(scanIndex);
+		}
+
+		@Override
+		public Iterator<IIon> iterator() {
+
+			return new StoreIterator(store, scanIndex);
+		}
+	}
+
+	private static final class StoreIterator implements Iterator<IIon> {
+
+		private final IChromatogramDataStore store;
+		private final int scanIndex;
+		private final int size;
+		private int cursor;
+
+		StoreIterator(IChromatogramDataStore store, int scanIndex) {
+
+			this.store = store;
+			this.scanIndex = scanIndex;
+			this.size = store.getIonCount(scanIndex);
+		}
+
+		@Override
+		public boolean hasNext() {
+
+			return cursor < size;
+		}
+
+		@Override
+		public IIon next() {
+
+			if(cursor >= size) {
+				throw new NoSuchElementException();
+			}
+			return new Ion(store.getMz(scanIndex, cursor), store.getIntensity(scanIndex, cursor++));
+		}
 	}
 }

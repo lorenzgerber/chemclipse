@@ -14,6 +14,7 @@
  *******************************************************************************/
 package org.eclipse.chemclipse.msd.model.core;
 
+import java.io.IOException;
 import java.util.List;
 
 import org.eclipse.chemclipse.chromatogram.xxd.calculator.core.noise.NoiseCalculator;
@@ -27,7 +28,12 @@ import org.eclipse.chemclipse.model.results.ChromatogramSegmentation;
 import org.eclipse.chemclipse.model.results.NoiseSegmentMeasurementResult;
 import org.eclipse.chemclipse.model.selection.IChromatogramSelection;
 import org.eclipse.chemclipse.model.updates.IChromatogramUpdateListener;
+import org.eclipse.chemclipse.logging.core.Logger;
 import org.eclipse.chemclipse.msd.model.core.selection.ChromatogramSelectionMSD;
+import org.eclipse.chemclipse.msd.model.core.IIonMSn;
+import org.eclipse.chemclipse.msd.model.core.store.ChromatogramDataStoreBuilder;
+import org.eclipse.chemclipse.msd.model.core.store.IChromatogramDataStore;
+import org.eclipse.chemclipse.msd.model.core.store.MappedChromatogramDataStore;
 import org.eclipse.chemclipse.msd.model.core.support.IMarkedIons;
 import org.eclipse.chemclipse.msd.model.implementation.ImmutableZeroIon;
 import org.eclipse.chemclipse.msd.model.implementation.IonTransitionSettings;
@@ -61,12 +67,15 @@ import org.eclipse.core.runtime.IProgressMonitor;
 public abstract class AbstractChromatogramMSD extends AbstractChromatogram implements IChromatogramMSD {
 
 	private static final long serialVersionUID = 6481555040060687481L;
+	private static final Logger logger = Logger.getLogger(AbstractChromatogramMSD.class);
 
 	public static final int DEFAULT_SEGMENT_WIDTH = 10;
 
 	private IIonTransitionSettings ionTransitionSettings = new IonTransitionSettings();
 	private ImmutableZeroIon immutableZeroIon = new ImmutableZeroIon();
 	private IScanMSD combinedMassSpectrum;
+	/** Compact data store shared by all scans in this chromatogram. */
+	private transient IChromatogramDataStore dataStore;
 
 	@Override
 	public <ResultType extends IMeasurementResult<?>> ResultType getMeasurementResult(Class<ResultType> type) {
@@ -234,6 +243,71 @@ public abstract class AbstractChromatogramMSD extends AbstractChromatogram imple
 			}
 		}
 		return highestIon;
+	}
+
+	/**
+	 * Attaches the given store to this chromatogram and wires each IScanMSD to its
+	 * zero-based index within the store. Call this after all scans have been added.
+	 */
+	public void setDataStore(IChromatogramDataStore store) {
+
+		if(this.dataStore != null) {
+			this.dataStore.close();
+		}
+		this.dataStore = store;
+		int index = 0;
+		for(IScan scan : getScans()) {
+			if(scan instanceof AbstractScanMSD scanMSD) {
+				scanMSD.attachStore(store, index++);
+			}
+		}
+	}
+
+	public IChromatogramDataStore getDataStore() {
+
+		return dataStore;
+	}
+
+	/** Release the backing store and its resources (temp file etc.). */
+	public void dispose() {
+
+		if(dataStore != null) {
+			dataStore.close();
+			dataStore = null;
+		}
+	}
+
+	/**
+	 * Rebuilds the compact data store from current scan ion data, then re-attaches
+	 * it to all scans — freeing any materialized IIon objects. Use after write-back
+	 * algorithms (e.g. icoshift) to recover the memory savings from store-backed loading.
+	 * Store type mirrors the existing store: MAPPED if currently file-backed, HEAP otherwise.
+	 */
+	public void repackToStore() {
+
+		List<IScan> scans = getScans();
+		ChromatogramDataStoreBuilder.StoreType type = (dataStore instanceof MappedChromatogramDataStore)
+				? ChromatogramDataStoreBuilder.StoreType.MAPPED
+				: ChromatogramDataStoreBuilder.StoreType.HEAP;
+		ChromatogramDataStoreBuilder builder = new ChromatogramDataStoreBuilder(scans.size(), type);
+		int scanIndex = 0;
+		for(IScan scan : scans) {
+			builder.beginScan(scanIndex);
+			if(scan instanceof AbstractScanMSD scanMSD) {
+				for(IIon ion : scanMSD.getIons()) {
+					if(!(ion instanceof IIonMSn)) {
+						builder.addIon(ion.getIon(), ion.getAbundance());
+					}
+				}
+			}
+			builder.endScan(scanIndex);
+			scanIndex++;
+		}
+		try {
+			setDataStore(builder.build());
+		} catch(IOException e) {
+			logger.warn(e);
+		}
 	}
 
 	@Override
